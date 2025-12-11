@@ -1,160 +1,149 @@
-# -*- coding: utf-8 -*-
-"""
-PIPELINE PRIX → CSV + SIGNAUX dans data/
-GitHub Actions compatible 
-"""
+# signals.py
 import os
 import pandas as pd
-import numpy as np
 from datetime import datetime
-import yfinance as yf
-from tiingo import TiingoClient
-
-# ====================== CONFIG ======================
-TIINGO_API_KEY = os.getenv('TIINGO_API_KEY')
-if not TIINGO_API_KEY:
-    raise ValueError("TIINGO_API_KEY manquante ! (définis-la dans les secrets GitHub)")
 
 DATA_FOLDER = "data"
-TIINGO_FOLDER = os.path.join(DATA_FOLDER, "tiingo")
-os.makedirs(DATA_FOLDER, exist_ok=True)
-os.makedirs(TIINGO_FOLDER, exist_ok=True)
 
-# ====================== CLEAN DATA ======================
-def clean_data(df):
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ajoute les indicateurs techniques nécessaires :
+    - rsi
+    - lower_bb, upper_bb
+    - macd, signal_line
+    """
+    import ta  # on importe ici pour éviter les erreurs si non utilisé ailleurs
+
     df = df.copy()
-    df['date'] = pd.to_datetime(df['date'])
-    df['date'] = df['date'].dt.normalize()
-    df = df.dropna()
-    df = df[df['High'] >= df['Low']]
-    df = df[df['Volume'] >= 0]
-    df = df.sort_values('date').drop_duplicates('date')
-    Q1, Q3 = df['Close'].quantile([0.25, 0.75])
-    IQR = Q3 - Q1
-    df['Close'] = np.clip(df['Close'], Q1 - 3 * IQR, Q3 + 3 * IQR)
-    df['date'] = df['date'].dt.strftime('%Y-%m-%d')
-    return df
 
-# ====================== YFINANCE ======================
-def collect_yfinance():
-    symbols = ["AAPL", "TSLA", "MSFT", "BTC-USD", "GOOGL"]
-    all_data = []
-    print("Collecte yfinance...")
-    for s in symbols:
-        df = yf.Ticker(s).history(period="1y").reset_index()
-        df['symbol'] = s
-        df['date'] = df['Date']
-        df = df[['date', 'Open', 'High', 'Low', 'Close', 'Volume', 'symbol']]
-        df = clean_data(df)
-        all_data.append(df)
-        df.to_csv(os.path.join(DATA_FOLDER, f"{s.replace('-USD', '')}.csv"), index=False)  # BTC-USD → BTC.csv
-    pd.concat(all_data).to_csv(os.path.join(DATA_FOLDER, "ALL_YFINANCE.csv"), index=False)
-    print("yfinance OK")
+    # S'assurer que les données sont triées par date si la colonne existe
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date")
 
-# ====================== TIINGO ======================
-def collect_tiingo():
-    client = TiingoClient({'api_key': TIINGO_API_KEY, 'session': True})
-    symbols = ["AAPL", "TSLA", "MSFT", "GOOGL"]
-    all_data = []
-    print("Collecte Tiingo...")
-    start_date = datetime.now().replace(year=datetime.now().year - 1)
-    for s in symbols:
-        df = client.get_dataframe(s, frequency='daily', startDate=start_date)
-        df = df.reset_index()
-        df['symbol'] = s
-        df = df[['date', 'open', 'high', 'low', 'close', 'volume', 'symbol']]
-        df.columns = ['date', 'Open', 'High', 'Low', 'Close', 'Volume', 'symbol']
-        df = clean_data(df)
-        all_data.append(df)
-    pd.concat(all_data).to_csv(os.path.join(TIINGO_FOLDER, "ALL_TIINGO.csv"), index=False)
-    print("Tiingo OK")
+    close = df["Close"]
 
-# ====================== SIGNAUX TECHNIQUES ======================
-def add_indicators(df):
-    df = df.copy()
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values('date')
+    # Bandes de Bollinger (20 jours)
+    bb = ta.volatility.BollingerBands(close, window=20, window_dev=2)
+    df["upper_bb"] = bb.bollinger_hband()
+    df["lower_bb"] = bb.bollinger_lband()
 
-    # Bollinger Bands (20)
-    df['ma20'] = df['Close'].rolling(20).mean()
-    df['std20'] = df['Close'].rolling(20).std()
-    df['upper_bb'] = df['ma20'] + 2 * df['std20']
-    df['lower_bb'] = df['ma20'] - 2 * df['std20']
-
-    # RSI 14
-    delta = df['Close'].diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=1/14, adjust=False).mean()
-    roll_down = down.ewm(alpha=1/14, adjust=False).mean()
-    rs = roll_up / roll_down
-    df['rsi'] = 100 - (100 / (1 + rs))
+    # RSI (14 jours)
+    df["rsi"] = ta.momentum.RSIIndicator(close, window=14).rsi()
 
     # MACD
-    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = ema12 - ema26
-    df['signal_line'] = df['macd'].ewm(span=9, adjust=False).mean()
+    macd_ind = ta.trend.MACD(close)
+    df["macd"] = macd_ind.macd()
+    df["signal_line"] = macd_ind.macd_signal()
 
+    # On supprime les premières lignes qui ont des NaN (début des indicateurs)
+    df = df.dropna().reset_index(drop=True)
     return df
 
+
 def generate_signals():
-    all_df = pd.read_csv(os.path.join(DATA_FOLDER, "ALL_YFINANCE.csv"))
+    """
+    Lit ALL_YFINANCE.csv, calcule les indicateurs, génère un signal par symbol,
+    sauvegarde latest_signals.csv + signals_history.csv et affiche un tableau.
+    """
+    all_path = os.path.join(DATA_FOLDER, "ALL_YFINANCE.csv")
+    if not os.path.exists(all_path):
+        raise FileNotFoundError(f"Fichier introuvable : {all_path}")
+
+    all_df = pd.read_csv(all_path)
     signals = []
 
-    for symbol in all_df['symbol'].unique():
-        df = all_df[all_df['symbol'] == symbol].copy()
+    # On garantit le bon format de la date
+    if "date" in all_df.columns:
+        all_df["date"] = pd.to_datetime(all_df["date"])
+
+    # Boucle sur chaque symbole
+    for symbol in all_df["symbol"].unique():
+        df = all_df[all_df["symbol"] == symbol].copy()
+
+        # On demande un minimum d'historique pour que les indicateurs soient stables
         if len(df) < 60:
             continue
 
+        # Ajout des indicateurs techniques
         df = add_indicators(df)
+
+        if len(df) < 2:
+            continue
+
+        # Dernier jour et jour précédent
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
-        buy_count = sum([
-            last['rsi'] < 30,
-            last['Close'] < last['lower_bb'],
-            (last['macd'] > last['signal_line']) or (last['macd'] > last['signal_line'] and prev['macd'] <= prev['signal_line'])
-        ])
-        sell_count = sum([
-            last['rsi'] > 70,
-            last['Close'] > last['upper_bb'],
-            last['macd'] < last['signal_line'] and prev['macd'] >= prev['signal_line']
-        ])
+        # ---- Règles BUY / SELL (au moins 2 conditions sur 3) ----
 
-        signal = "BUY" if buy_count >= 2 else "SELL" if sell_count >= 2 else "HOLD"
+        # Conditions BUY
+        cond_rsi_buy = last["rsi"] < 30
+        cond_bb_buy = last["Close"] < last["lower_bb"]
+        cond_macd_buy = (last["macd"] > last["signal_line"]) and (prev["macd"] <= prev["signal_line"])
+        buy_count = sum([cond_rsi_buy, cond_bb_buy, cond_macd_buy])
+
+        # Conditions SELL
+        cond_rsi_sell = last["rsi"] > 70
+        cond_bb_sell = last["Close"] > last["upper_bb"]
+        cond_macd_sell = (last["macd"] < last["signal_line"]) and (prev["macd"] >= prev["signal_line"])
+        sell_count = sum([cond_rsi_sell, cond_bb_sell, cond_macd_sell])
+
+        if buy_count >= 2:
+            signal = "BUY"
+        elif sell_count >= 2:
+            signal = "SELL"
+        else:
+            signal = "HOLD"
+
+        # Position par rapport aux bandes
+        if last["Close"] < last["lower_bb"]:
+            bb_position = "BELOW"
+        elif last["Close"] > last["upper_bb"]:
+            bb_position = "ABOVE"
+        else:
+            bb_position = "INSIDE"
+
+        # Histogramme MACD (différence entre MACD et signal_line)
+        macd_hist = last["macd"] - last["signal_line"]
 
         signals.append({
-            'symbol': symbol,
-            'date': last['date'].strftime('%Y-%m-%d'),
-            'close': round(last['Close'], 2),
-            'rsi': round(last['rsi'], 2),
-            'bb_position': 'BELOW' if last['Close'] < last['lower_bb'] else 'ABOVE' if last['Close'] > last['upper_bb'] else 'INSIDE',
-            'macd_hist': round(last['macd'] - last['signal_line'], 4),
-            'recommendation': signal
+            "symbol": symbol,
+            "date": last["date"].strftime("%Y-%m-%d") if isinstance(last["date"], pd.Timestamp) else last["date"],
+            "close": round(last["Close"], 2),
+            "rsi": round(last["rsi"], 2),
+            "bb_position": bb_position,
+            "macd_hist": round(macd_hist, 4),
+            "recommendation": signal
         })
 
+    # DataFrame des signaux du jour
     signals_df = pd.DataFrame(signals)
-    
-    # Sauvegarde quotidienne + historique
-    signals_df.to_csv(os.path.join(DATA_FOLDER, "latest_signals.csv"), index=False)
-    
+
+    # Sauvegarde des signaux du jour
+    latest_path = os.path.join(DATA_FOLDER, "latest_signals.csv")
+    signals_df.to_csv(latest_path, index=False)
+
+    # Sauvegarde dans l'historique
     history_path = os.path.join(DATA_FOLDER, "signals_history.csv")
     if os.path.exists(history_path):
         history_df = pd.read_csv(history_path)
         signals_df = pd.concat([history_df, signals_df], ignore_index=True)
-    signals_df.to_csv(history_path, index=False)
-    
-    print("\n=== SIGNAUX DU JOUR (20 novembre 2025) ===")
-    print(signals_df.to_markdown(index=False))
 
-# ====================== MAIN ======================
+    signals_df.to_csv(history_path, index=False)
+
+    # Affichage
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    print(f"\n=== SIGNAUX DU JOUR ({today_str}) ===")
+    try:
+        print(signals_df.to_markdown(index=False))
+    except Exception:
+        print(signals_df)
+
+
 def main():
-    print("DÉBUT PIPELINE -", datetime.now().strftime("%Y-%m-%d %H:%M"))
-    collect_yfinance()
-    collect_tiingo()
     generate_signals()
-    print("TERMINÉ – PRIX + SIGNAUX dans data/")
+
 
 if __name__ == "__main__":
     main()
